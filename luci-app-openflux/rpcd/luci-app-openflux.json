@@ -1,0 +1,17 @@
+{
+	"luci-app-openflux": {
+		"description": "Grant UCI access for luci-app-openflux",
+		"read": {
+			"uci": ["openflux"],
+			"ubus": {
+				"service": ["list"]
+			},
+			"file": {
+				"/var/log/openflux.log": ["read"]
+			}
+		},
+		"write": {
+			"uci": ["openflux"]
+		}
+	}
+}

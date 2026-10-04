@@ -1,0 +1,15 @@
+{
+	"admin/services/openflux": {
+		"title": "OpenFlux",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "openflux"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-openflux"
+			]
+		}
+	}
+}

@@ -1,0 +1,22 @@
+# Пример второй стороны (телефон/ноутбук) — пара к ноде на домашнем роутере.
+# Тот же URL общего документа и тот же общий секрет, что на роутере.
+# Режим сессии (--negotiate) обязателен с обеих сторон.
+
+# Вариант флагами:
+# ./openflux --role=client --inbound=socks5 \
+#   --transport=mailru --url="https://cloud.mail.ru/public/XXXX/YYYY" \
+#   --encryption-key-file=secret.txt \
+#   --cookie-store=/tmp/cookies-mailru.json \
+#   --negotiate --socks5=127.0.0.1:1080
+# Браузер/приложение -> SOCKS5 127.0.0.1:1080
+
+# Вариант .conf (./openflux --config=client.conf):
+[Interface]
+Role = client
+Inbound = socks5
+Transport = mailru
+URL = https://cloud.mail.ru/public/XXXX/YYYY
+EncryptionKeyFile = secret.txt
+CookieStore = /tmp/cookies-mailru.json
+Socks5 = 127.0.0.1:1080
+# Negotiate включается флагом --negotiate в командной строке
