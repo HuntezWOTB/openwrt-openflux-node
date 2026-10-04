@@ -1,0 +1,223 @@
+#!/bin/sh
+# rpcd backend for luci-app-openflux.
+# ubus object `luci.openflux`: getStatus, getLog, setAction.
+# Same exec pattern as luci.https-dns-proxy (list/call, jshn.sh).
+#
+# Manual test on router:
+#   ubus -S call luci.openflux getStatus
+#   ubus -S call luci.openflux getLog '{"lines":"30"}'
+#   ubus -S call luci.openflux setAction '{"action":"restart"}'
+
+readonly packageName="openflux"
+
+. "${IPKG_INSTROOT}/lib/functions.sh"
+. "${IPKG_INSTROOT}/usr/share/libubox/jshn.sh"
+
+is_enabled() { "/etc/init.d/${packageName}" enabled >/dev/null 2>&1; }
+is_running() { "/etc/init.d/${packageName}" running >/dev/null 2>&1; }
+uci_get() { uci -q get "openflux.main.$1"; }
+log_tail() { logread -e openflux 2>/dev/null | tail -n "${1:-50}"; }
+
+# stopped|error|captcha|connected|waiting|starting
+detect_state() {
+	local logs="$1"
+	if ! is_running; then echo "stopped"; return; fi
+	if printf '%s' "$logs" | grep -q "too short\|secret .*missing\|URL is empty\|not found"; then echo "error"; return; fi
+	if printf '%s' "$logs" | grep -q "SmartCaptcha\|captcha required\|external solver"; then echo "captcha"; return; fi
+	# живой трафик = сессия есть (даже если стартовые строки уже уехали из хвоста)
+	if printf '%s' "$logs" | grep -q "SESSION established\|established=[1-9]\|packets=[1-9]\|peer connected\|LinkPing\|CRYPTO.*\(Send\|Recv\)\|TUNNEL.*bytes\|BATCH.*\(Recv\|Send\|sent OK\)"; then echo "connected"; return; fi
+	if printf '%s' "$logs" | grep -q "waiting for a client\|Running as EXIT\|Auth OK\|WebSocket connected\|connectToDoc\|fetchDocInfo\|M-DOCS\|YDOCS"; then echo "waiting"; return; fi
+	# процесс есть и журнал не пуст, но узнать нечего — считаем ожиданием, а не стартом
+	if [ -n "$logs" ]; then echo "waiting"; return; fi
+	echo "starting"
+}
+
+get_status() {
+	local logs state transport url url_host cookie secret_file secret_len cookie_ok
+	logs="$(log_tail 40)"
+	state="$(detect_state "$logs")"
+	transport="$(uci_get transport)"
+	url="$(uci_get url)"
+	url_host="$(printf '%s' "$url" | sed -e 's#^[a-zA-Z]*://##' -e 's#/.*##' -e 's#?.*##')"
+	cookie="$(uci_get cookie_store)"
+	secret_file="$(uci_get encryption_key_file)"
+	[ -z "$secret_file" ] && secret_file="/etc/openflux/secret.txt"
+	secret_len=0
+	[ -f "$secret_file" ] && secret_len="$(wc -c < "$secret_file" 2>/dev/null | tr -d ' ')"
+	[ -z "$secret_len" ] && secret_len=0
+	cookie_ok=0
+	[ -n "$cookie" ] && [ -f "$cookie" ] && cookie_ok=1
+	json_init
+	json_add_object "$packageName"
+	if is_enabled; then json_add_boolean 'enabled' '1'; else json_add_boolean 'enabled' '0'; fi
+	if is_running; then json_add_boolean 'running' '1'; else json_add_boolean 'running' '0'; fi
+	json_add_string 'state' "$state"
+	json_add_string 'transport' "$transport"
+	json_add_string 'url_host' "$url_host"
+	json_add_string 'captcha' "$(detect_captcha "$logs")"
+	json_add_string 'account' "$(detect_account)"
+	json_add_int 'secret_len' "$secret_len"
+	json_add_boolean 'cookie_ok' "$cookie_ok"
+	json_close_object
+	json_dump
+	json_cleanup
+}
+
+get_log() {
+	local lines="$1" n=30
+	case "$lines" in ''|*[!0-9]*) n=30 ;; *) n="$lines" ;; esac
+	[ "$n" -gt 100 ] && n=100
+	[ "$n" -lt 5 ] && n=5
+	json_init
+	json_add_object "$packageName"
+	json_add_array 'lines'
+	# NB: цикл читает файл через `<`, а не пайп — иначе в sh он уйдет
+	# в subshell и json_add_string потеряется.
+	local tmp="/tmp/luci.openflux.log"
+	log_tail "$n" > "$tmp" 2>/dev/null
+	while IFS= read -r line; do
+		json_add_string '' "$line"
+	done < "$tmp"
+	rm -f "$tmp"
+	json_close_array
+	json_dump
+	json_cleanup
+}
+
+# setSecret: сохраняет общий секрет (только A-Za-z0-9, минимум 16 символов).
+set_secret() {
+	local secret secret_len=0 ok=0
+	secret="$(printf '%s' "$1" | tr -d ' \t\r\n')"
+	if [ "${#secret}" -ge 16 ] && printf '%s' "$secret" | grep -q "^[A-Za-z0-9][A-Za-z0-9]*$"; then
+		mkdir -p /etc/openflux
+		printf '%s\n' "$secret" > /etc/openflux/secret.txt
+		chmod 600 /etc/openflux/secret.txt 2>/dev/null
+		secret_len="${#secret}"
+		ok=1
+	fi
+	json_init
+	json_add_boolean 'ok' "$ok"
+	json_add_int 'secret_len' "$secret_len"
+	json_dump
+	json_cleanup
+}
+
+# Проверка доступа: required|passed|none (по свежим строкам журнала).
+detect_captcha() {
+	local logs="$1"
+	if printf '%s' "$logs" | grep -q "SmartCaptcha\|captcha required\|external solver"; then echo "required"; return; fi
+	if printf '%s' "$logs" | grep -q "Auth OK\|WebSocket connected\|SESSION established\|packets=[1-9]\|TUNNEL.*bytes\|M-DOCS\|YDOCS"; then echo "passed"; return; fi
+	echo "none"
+}
+
+# Аккаунт облака, если транспорт его называл (напр. "Auth OK for user 123").
+detect_account() {
+	logread -e openflux 2>/dev/null | grep -o "Auth OK for user [^ ]*" | tail -n 1 | sed 's/^Auth OK for user //'
+}
+
+# wipeDoc: стереть URL + вставленные куки + файл кук и остановить сервис.
+# Для долгого простоя, чтобы данные документа не валялись на роутере.
+wipe_doc() {
+	local cookie
+	cookie="$(uci_get cookie_store)"
+	uci -q delete openflux.main.url
+	uci -q delete openflux.main.cookies_paste
+	uci commit openflux 2>/dev/null
+	[ -n "$cookie" ] && rm -f "$cookie" "$cookie.tmp" 2>/dev/null
+	"/etc/init.d/${packageName}" stop >/dev/null 2>&1
+	json_init
+	json_add_boolean 'ok' '1'
+	json_dump
+	json_cleanup
+}
+
+# getSecret: отдать текущий секрет (для кнопки-глазка в панели).
+# Доступно только аутентифицированным пользователям LuCI (см. ACL).
+get_secret() {
+	local f secret ok=0
+	f="$(uci_get encryption_key_file)"
+	[ -z "$f" ] && f="/etc/openflux/secret.txt"
+	secret="$(tr -d ' \t\r\n' < "$f" 2>/dev/null)"
+	[ "${#secret}" -ge 16 ] && ok=1 || secret=""
+	json_init
+	json_add_boolean 'ok' "$ok"
+	json_add_string 'secret' "$secret"
+	json_dump
+	json_cleanup
+}
+
+set_action() {
+	local action="$1" ok=0
+	case "$action" in
+		start|stop) "/etc/init.d/${packageName}" "$action" >/dev/null 2>&1 && ok=1 ;;
+		restart|reload)
+			"/etc/init.d/${packageName}" stop >/dev/null 2>&1
+			sleep 2
+			"/etc/init.d/${packageName}" start >/dev/null 2>&1 && ok=1
+			;;
+		enable) "/etc/init.d/${packageName}" enable >/dev/null 2>&1 && ok=1 ;;
+		disable) "/etc/init.d/${packageName}" disable >/dev/null 2>&1 && ok=1 ;;
+	esac
+	json_init
+	json_add_boolean 'ok' "$ok"
+	json_add_string 'action' "$action"
+	json_dump
+	json_cleanup
+}
+
+case "$1" in
+	list)
+		json_init
+		json_add_object "getStatus"
+		json_close_object
+		json_add_object "getSecret"
+		json_close_object
+		json_add_object "getLog"
+			json_add_string 'lines' "lines"
+		json_close_object
+		json_add_object "setAction"
+			json_add_string 'action' "action"
+		json_close_object
+		json_add_object "setSecret"
+			json_add_string 'secret' "secret"
+		json_close_object
+		json_add_object "wipeDoc"
+		json_close_object
+		json_dump
+		json_cleanup
+		;;
+	call)
+		case "$2" in
+			getStatus)
+				get_status
+				;;
+			getSecret)
+				get_secret
+				;;
+			getLog)
+				read -r input
+				json_load "$input"
+				json_get_var lines "lines"
+				json_cleanup
+				get_log "$lines"
+				;;
+			setAction)
+				read -r input
+				json_load "$input"
+				json_get_var action "action"
+				json_cleanup
+				set_action "$action"
+				;;
+			setSecret)
+				read -r input
+				json_load "$input"
+				json_get_var secret "secret"
+				json_cleanup
+				set_secret "$secret"
+				;;
+			wipeDoc)
+				wipe_doc
+				;;
+		esac
+		;;
+esac
